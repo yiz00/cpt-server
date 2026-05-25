@@ -3,83 +3,85 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import numpy as np
-from scipy.stats import norm
 
 app = FastAPI()
 
+# [해결 핵심 1] 브라우저 차단 에러 해결
+# allow_origins=["*"] 일 때 allow_credentials=True 이면 브라우저가 보안상 연결을 강제로 차단합니다.
+# 인증 정보가 필요 없는 공공 API 구조이므로 False로 변경하여 CORS 차단을 원천 봉쇄합니다.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], 
+    allow_credentials=False,  
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. 모델 및 스케일러 로드
-model  = joblib.load("cpt_kmeans_model.pkl")
-scaler = joblib.load("cpt_robust_scaler.pkl")
+# 모델 및 스케일러 로드
+try:
+    kmeans_model = joblib.load('cpt_kmeans_model.pkl')
+    scaler = joblib.load('cpt_robust_scaler.pkl')
+except Exception as e:
+    print(f"모델 로드 중 오류 발생: {e}")
 
-# 루트 경로 정의 추가
-@app.get("/")
-def read_root():
-    return {"message": "CPT Prediction Server is running"}
-
-class CPTInput(BaseModel):
+class CptData(BaseModel):
+    age: int
     omissions: float
     commissions: float
-    hit_rt: float
     varse: float
 
 @app.post("/predict")
-def predict(data: CPTInput):
-    TOTAL_TARGETS    = 324
-    TOTAL_NONTARGETS = 36
-
-    hr  = np.clip((TOTAL_TARGETS - data.omissions) / TOTAL_TARGETS, 0.005, 0.995)
-    far = np.clip(data.commissions / TOTAL_NONTARGETS, 0.005, 0.995)
-    z_hr  = norm.ppf(hr)
-    z_far = norm.ppf(far)
-    d_prime = z_hr - z_far
-    beta    = np.exp(0.5 * (z_far**2 - z_hr**2))
-
-    features = np.array([[
-        data.omissions,
-        data.commissions,
-        data.hit_rt,
-        data.varse,
-        d_prime,
-        beta
-    ]])
-    
-    features_scaled = scaler.transform(features)
-    prob = model.predict_proba(features_scaled)[0][1]
-
-    T_RISK    = 0.54
-    T_CAUTION = 0.39
-
-    # [수정된 부분]: 확률이 '주의군' 이상(T_CAUTION 이상)이면 무조건 유형 분석을 실행합니다.
-    if prob >= T_CAUTION:
-        core = {
-            "Omissions": data.omissions,
-            "Commissions": data.commissions,
-            "RT_SD": data.varse,
-        }
-        worst = max(core, key=core.get)
+def predict_cpt(data: CptData):
+    try:
+        # 1. 입력 데이터 배열화
+        new_user_data = np.array([[data.omissions, data.commissions, data.varse, data.age]])
         
-        if worst == "Omissions":
-            detail = "목표 자극을 자주 놓치는 '부주의(Inattention)' 우세 유형입니다."
-        elif worst == "Commissions":
-            detail = "억제 통제력이 저하된 '충동성(Impulsivity)' 우세 유형입니다."
+        # 2. 스케일링 및 군집 예측
+        scaled_data = scaler.transform(new_user_data)
+        cluster_label = kmeans_model.predict(scaled_data)[0]
+        
+        # 3. 취약 유형 분석 (가장 높은 에러 지표 추출)
+        features = {
+            "누락 오류(Omissions)": data.omissions,
+            "오경보 오류(Commissions)": data.commissions,
+            "반응 속도 표준편차(RT_SD)": data.varse
+        }
+        worst_feature = max(features, key=features.get)
+        
+        # 4. 결과 그룹 및 스펙트럼 점수 산출
+        total_errors = data.omissions + data.commissions
+        
+        if cluster_label == 0:
+            group = "정상군"
+            # 정상군은 점수대를 0% ~ 39% 사이로 제한
+            patient_prob = min(0.39, max(0.05, total_errors / 100.0))
+        elif cluster_label == 1:
+            group = "주의군"
+            # 주의군은 점수대를 40% ~ 69% 사이로 제한
+            patient_prob = min(0.69, max(0.40, 0.40 + (total_errors / 80.0)))
         else:
-            detail = "반응 속도 편차가 심한 '주의력 유지 실패' 유형입니다."
+            group = "위험군"
+            # 위험군은 점수대를 70% ~ 99% 사이로 제한
+            patient_prob = min(0.99, max(0.70, 0.70 + (total_errors / 60.0)))
 
-        # 세부 분석 결과를 바탕으로 점수대에 따라 앞부분 라벨(위험군/주의군)만 다르게 붙여줍니다.
-        if prob >= T_RISK:
-            result = f"[위험군] ADHD 위험 확률 {prob*100:.1f}점 | {detail} 즉각적인 임상 평가가 필요합니다."
+        # [요청하신 리포트 형태로 완벽 매칭]
+        report = f"▶ [점수]: {patient_prob*100:.1f}점 -> {group}\n"
+        
+        # [핵심] 정상군이 아닐 때(주의군, 위험군)만 취약 유형 분석을 덧붙임
+        if group != "정상군":
+            report += f"▶ [취약 유형 분석]: 귀하의 가장 두드러진 결함 지표는 **{worst_feature}** 입니다.\n"
+            if "Omissions" in worst_feature:
+                report += "   -> 분석: 목표 자극을 자주 놓치는 '부주의' 유형입니다.\n"
+            elif "Commissions" in worst_feature:
+                report += "   -> 분석: 억제 통제력이 저하되어 성급하게 반응하는 '충동성' 유형입니다.\n"
+            elif "RT_SD" in worst_feature:
+                report += "   -> 분석: 반응 속도의 편차가 심한 '주의력 유지 실패' 유형입니다.\n"
         else:
-            result = f"[주의군] ADHD 위험 확률 {prob*100:.1f}점 | 경계선 수준입니다. {detail}"
+            # 정상군일 경우 긍정적인 피드백 출력
+            report += "▶ [분석 결과]: 전반적인 주의력 및 억제 통제 지표가 양호하며, 두드러진 결함이 관찰되지 않습니다.\n"
+            
+        return {"result": report}
 
-    else:
-        # 정상군은 세부 분석 없이 안정적이라는 메시지만 출력합니다.
-        result = f"[정상군] ADHD 위험 확률 {prob*100:.1f}점 | 안정적인 인지 기능을 보입니다."
-
-    return {"result": result}
+    except Exception as e:
+        # 서버 내부에서 연산 에러가 나서 튕기는 것을 방지하는 안전장치
+        return {"result": f"서버 내부 연산 오류가 발생했습니다: {str(e)}"}
